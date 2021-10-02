@@ -1,14 +1,14 @@
-#include <analogWrite.h>
+#include "analogWrite.h"
+#define RESOLUTION 10 
 
-int in1 = 0;
-int in2 = 0;
-int en = 0;
-
+int in1 = 18;
+int in2 = 23;
+int en = 2;
 
 void setup() {
   pinMode(in1, OUTPUT);
   pinMode(in2, OUTPUT);
-  pinMode(en, OUTPUT);
+  analogWriteResolution(en, 8);
 }
 
 void loop() {
