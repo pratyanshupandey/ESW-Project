@@ -1,8 +1,14 @@
+#include "mbedtls/base64.h"
+#include "mbedtls/md.h"
 #include "analogWrite.h"
 #include <Arduino_JSON.h>
 #include <time.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <base64.h>
+
+char PADDING = '#';
+String key = "prapvedmpstuubha";
 
 TaskHandle_t Task1;
 TaskHandle_t Task2;
@@ -15,6 +21,13 @@ struct SensorData
     float pos[100];
     int count;
     int target;
+    String rn;
+};
+
+struct QueueData
+{
+    int target;
+    String rn;
 };
 
 int IN1 = 18;
@@ -36,7 +49,7 @@ String post_sensordata_url = "http://esw-onem2m.iiit.ac.in:443/~/in-cse/in-name/
 
 uint wifi_delay = 5000;
 uint lastTime = 0;
-#define PID_TIMER 5000
+#define PID_TIMER 10000
 
 HTTPClient http;
 
@@ -60,11 +73,12 @@ void setup() {
     Serial.print("\nConnected to WiFi network with IP Address: ");
     Serial.println(WiFi.localIP());
 
+
     xQueue_sensor = xQueueCreate( 5, sizeof( struct SensorData ) );
-    xQueue_target = xQueueCreate( 5, sizeof( int ));
+    xQueue_target = xQueueCreate( 5, sizeof( struct QueueData ));
 
 
-    xTaskCreatePinnedToCore(Task1code,"Task1",4000,NULL,5,&Task1,0);                         
+    xTaskCreatePinnedToCore(Task1code,"Task1",40000,NULL,5,&Task1,0);                         
     delay(1000); 
 
 }
@@ -74,7 +88,8 @@ void Task1code( void * parameter ){
     Serial.println(xPortGetCoreID());
 
     String tq_rn[5] = {"", "", "", "", ""};
-
+    unsigned char decoded[1000];
+    
     for(;;){
         if(WiFi.status()== WL_CONNECTED)
         {
@@ -117,9 +132,38 @@ void Task1code( void * parameter ){
                         if(j == 5)
                         {
 
-                            String target_string = (const char*)myObject["m2m:cnt"]["m2m:cin"][i]["con"];
+                            String data_string = (const char*)myObject["m2m:cnt"]["m2m:cin"][i]["con"];
+                            Serial.println(data_string);
+                            String hash = "";
+                            String target_string = "";
+                            int len = data_string.length();
+                            if (len < 66)
+                              continue;
+                            for(int k = 0; k < len; k++)
+                              if(k < 64)
+                                hash += data_string[k];
+                              else if(k > 64)
+                                target_string += data_string[k];
+
+                            if(hash != calc_sha256(target_string))
+                            {
+                              Serial.println("Corrupted Data");
+                              continue;
+                            }
+               
+                            size_t outputLength;
+                            mbedtls_base64_decode(decoded, 1000, &outputLength, (const unsigned char *)target_string.c_str(), target_string.length());
+                            
+                            String tmp = "";
+                            for(int k = 0; k < outputLength; k++)
+                                tmp += (char)decoded[k];
+                            target_string = decrypt(tmp, key);
                             int target = target_string.toInt();
-                            xQueueSend(xQueue_target, &target, portMAX_DELAY);
+                            struct QueueData qd;
+                            qd.target = target;
+                            qd.rn = rn;
+                            
+                            xQueueSend(xQueue_target, &qd, portMAX_DELAY);
 
 
                             struct SensorData sensor_data;
@@ -138,8 +182,8 @@ void Task1code( void * parameter ){
                         }
                     }
 
-                    for(int i = 0; i < len; i++)
-                        tq_rn[i] = (const char*)myObject["m2m:cnt"]["m2m:cin"][i]["rn"];
+                    for(int k = 0; k < len; k++)
+                        tq_rn[k] = (const char*)myObject["m2m:cnt"]["m2m:cin"][k]["rn"];
 
                 }        
             }
@@ -158,27 +202,28 @@ void Task1code( void * parameter ){
 }
 
 void loop(){
-    int target;
-    if (xQueueReceive( xQueue_target, &target, portMAX_DELAY ) == pdPASS)
+    struct QueueData qd;
+    if (xQueueReceive( xQueue_target, &qd, portMAX_DELAY ) == pdPASS)
     {
-        Serial.print( "Received = ");
-        Serial.println(target);
+//        Serial.print( "Received = ");
+//        Serial.println(target);
         
 
-        PID_control(target);
+        PID_control(qd);
         setMotor(0,0,PWM,IN1,IN2); 
     }
 }
 
-void PID_control(int target)
+void PID_control(struct QueueData qd)
 {
     
     uint startTime = millis();
     uint lastTime = millis();
     struct SensorData sensor_data;
+    sensor_data.rn = qd.rn;
     sensor_data.count = 0;
-    sensor_data.target = target;
-    target = target * 46.0 * 11.0 / 360.0;
+    sensor_data.target = qd.target;
+    int target = qd.target * 46.0 * 11.0 / 360.0;
     while(millis()- startTime < PID_TIMER){
 
         // PID constants
@@ -293,10 +338,13 @@ void readEncoder(){
 
 void sendSensorData(struct SensorData sensor_data_st)
 {
+    if(sensor_data_st.count <= 0)
+      return;
+      
     Serial.println(millis());
-    String sensor_data = "";
+    String sensor_data = sensor_data_st.rn + ":" + (String)sensor_data_st.target;
     for(int i = 0; i < sensor_data_st.count; i++)
-        sensor_data += (String)sensor_data_st.timestamp[i] + ":" + (String)sensor_data_st.pos[i] + ":" + (String)sensor_data_st.target + ",";
+        sensor_data += "," + (String)sensor_data_st.timestamp[i] + ":" + (String)sensor_data_st.pos[i];
 
     http.begin(post_sensordata_url.c_str());
 
@@ -307,11 +355,14 @@ void sendSensorData(struct SensorData sensor_data_st)
     http.addHeader("X-M2M-Origin", "KK382AITgR:WPN0JcTeJd");
     http.addHeader("Content-Type", "application/json;ty=4");
 
+    String enc = base64::encode(encrypt(sensor_data, key));
+    String hashed = calc_sha256(enc) + "|" + enc;
+    
     String ciRepresentation =
         "{\"m2m:cin\": {"
-        "\"con\":\"" + sensor_data + "\""
+        "\"con\":\"" + hashed + "\""
         "}}";
-    // Send HTTP GET request
+    
     int httpResponseCode = http.POST(ciRepresentation);
     Serial.print("HTTP Response code: ");
     Serial.println(httpResponseCode);
@@ -321,4 +372,67 @@ void sendSensorData(struct SensorData sensor_data_st)
     // Free resources
     http.end();
     Serial.println(millis());
+}
+
+
+String encrypt(String text, String key)
+{
+  String res = "";
+  int text_len = text.length(), key_len = key.length(), i = 0, j = 0;
+  int padding = (key_len - (text_len % key_len))%key_len;
+  for(i = 0; i < padding; i++)
+    text += PADDING;
+  text_len = text.length();
+
+  i = 0;
+  while(i < text_len)
+  {
+    res += (char)(text[i] ^ key[j]);
+    i++;
+    j = (j + 1) % key_len;
+  }
+  return res;
+}
+
+String decrypt(String text, String key)
+{
+  String res = "";
+  int text_len = text.length(), key_len = key.length(), i = 0, j = 0;
+  
+  while(i < text_len)
+  {
+    text[i] ^= key[j];
+    if(text[i] == PADDING)
+      break;
+    else
+      res += text[i];
+    i++;
+    j = (j + 1) % key_len;
+  }
+  return res;
+}
+
+String calc_sha256(String text)
+{
+  byte shaResult[32];
+  
+  mbedtls_md_context_t ctx;
+  mbedtls_md_type_t md_type = MBEDTLS_MD_SHA256;
+  
+  const size_t payloadLength = text.length();         
+  
+  mbedtls_md_init(&ctx);
+  mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(md_type), 0);
+  mbedtls_md_starts(&ctx);
+  mbedtls_md_update(&ctx, (const unsigned char *) text.c_str(), payloadLength);
+  mbedtls_md_finish(&ctx, shaResult);
+  mbedtls_md_free(&ctx); 
+
+  String result = "";
+  for(int i= 0; i< sizeof(shaResult); i++){
+      char str[3];
+      sprintf(str, "%02x", (int)shaResult[i]);
+      result += str;
+  }
+  return result;
 }
